@@ -1,0 +1,4 @@
+export enum NotificationType {
+  GENERAL = 'GENERAL',
+  SUBSCRIPTION_EXPIRING = 'SUBSCRIPTION_EXPIRING',
+}

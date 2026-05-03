@@ -1,0 +1,285 @@
+import {
+  Controller,
+  Get,
+  Post,
+  Req,
+  UseGuards,
+  Res,
+  UnauthorizedException,
+  Body,
+  Logger,
+} from '@nestjs/common';
+import { Request, Response } from 'express';
+import { AuthenticationService } from './authentication.service';
+import { EmployeeAuthenticationService, EmployeeLoginDto } from './services/employee-authentication.service';
+import { PasswordResetService } from './services/password-reset.service';
+import { GmailTokenService, ScopeResponse } from './services/gmail-token.service';
+import { SignupDto } from './dto/signup.dto';
+import { LoginDto } from './dto/login.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { VerifyResetOtpDto } from './dto/verify-reset-otp.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
+import { Public } from 'src/configuration/jwt/public.decorator';
+import { AuthGuard } from '@nestjs/passport';
+import { GoogleAuthGuard } from './guards/google-auth.guard';
+import { GoogleGmailAuthGuard } from './guards/google-gmail-auth.guard';
+import { ConfigService } from '@nestjs/config';
+import { JwtPayload } from 'src/configuration/jwt/interfaces/jwt-payload.interface';
+import { RiscService } from './services/risc.service';
+
+interface AuthenticatedRequest extends Request {
+  user?: JwtPayload & {
+    firstName?: string;
+    lastName?: string;
+    avatarUrl?: string;
+    organization?: any;
+  };
+}
+
+interface OAuthCallbackRequest extends Request {
+  user?: {
+    access_token: string;
+    refresh_token: string;
+  };
+}
+
+@Controller()
+export class AuthenticationController {
+  private readonly logger = new Logger(AuthenticationController.name);
+
+  constructor(
+    private readonly authenticationService: AuthenticationService,
+    private readonly employeeAuthenticationService: EmployeeAuthenticationService,
+    private readonly passwordResetService: PasswordResetService,
+    private readonly gmailTokenService: GmailTokenService,
+    private readonly configService: ConfigService,
+    private readonly riscService: RiscService,
+  ) {}
+
+  @Public()
+  @Post('signup')
+  async signup(@Body() signupDto: SignupDto) {
+    return this.authenticationService.signup(signupDto);
+  }
+
+  @Public()
+  @Post('login')
+  async login(@Body() loginDto: LoginDto) {
+    return this.authenticationService.login(loginDto);
+  }
+
+  @Public()
+  @Get('google')
+  @UseGuards(AuthGuard('google'))
+  async googleAuth() {}
+
+  @Public()
+  @Get('google/callback')
+  @UseGuards(GoogleAuthGuard)
+  async googleAuthCallback(@Req() req: OAuthCallbackRequest, @Res() res: Response) {
+    const frontendUrl = this.configService.get('FRONTEND_URL');
+    const result = req.user;
+
+    if (!result?.access_token) {
+      return res.redirect(
+        `${frontendUrl}/auth/error?error=invalid_user&message=${encodeURIComponent('Invalid user data received')}`,
+      );
+    }
+
+    return res.redirect(
+      `${frontendUrl}/auth/callback?token=${encodeURIComponent(result.access_token)}&refresh=${encodeURIComponent(result.refresh_token)}`,
+    );
+  }
+
+  @Public()
+  @Get('google/gmail')
+  @UseGuards(AuthGuard('google-gmail'))
+  async googleGmailAuth() {}
+
+  @Public()
+  @Get('google/gmail/callback')
+  @UseGuards(GoogleGmailAuthGuard)
+  async googleGmailCallback(@Req() req: OAuthCallbackRequest, @Res() res: Response) {
+    const frontendUrl = this.configService.get('FRONTEND_URL');
+    const result = req.user;
+
+    if (!result?.access_token) {
+      return res.redirect(
+        `${frontendUrl}/dashboard/campaigns?error=invalid_user&message=${encodeURIComponent('Invalid user data received')}`,
+      );
+    }
+
+    return res.redirect(
+      `${frontendUrl}/auth/callback?token=${encodeURIComponent(result.access_token)}&refresh=${encodeURIComponent(result.refresh_token)}&gmail_authorized=true`,
+    );
+  }
+
+  @Get('scopes')
+  async getScopes(@Req() req: AuthenticatedRequest) {
+    if (!req.user) {
+      throw new UnauthorizedException('Not authenticated');
+    }
+
+    const scopes = await this.gmailTokenService.getUserScopes(req.user.sub);
+
+    return {
+      success: true,
+      data: scopes,
+    };
+  }
+
+  @Post('revoke')
+  async revokeTokens(@Req() req: AuthenticatedRequest) {
+    if (!req.user) {
+      throw new UnauthorizedException('Not authenticated');
+    }
+
+    await this.gmailTokenService.revokeUserTokens(req.user.sub);
+
+    return {
+      success: true,
+      message: 'Tokens revoked successfully',
+    };
+  }
+
+  @Public()
+  @Post('risc/events')
+  async handleRiscEvent(@Req() req: Request, @Res() res: Response) {
+    try {
+      let token: string | undefined;
+
+      if (typeof req.body === 'string') {
+        token = req.body;
+      } else if (req.body?.assertion) {
+        token = req.body.assertion;
+      } else if (req.body?.jwt) {
+        token = req.body.jwt;
+      } else if (req.body?.token) {
+        token = req.body.token;
+      }
+
+      if (!token || typeof token !== 'string') {
+        this.logger.warn('RISC event received without JWT token', { body: req.body });
+        return res.status(400).json({
+          success: false,
+          message: 'Missing JWT token in request',
+        });
+      }
+
+      const verifiedEvent = await this.riscService.verifyRiscToken(token);
+      await this.riscService.processRiscEvent(verifiedEvent);
+
+      return res.status(200).json({
+        success: true,
+        message: 'RISC event processed successfully',
+      });
+    } catch (error) {
+      this.logger.error(
+        `Failed to process RISC event: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+
+      return res.status(200).json({
+        success: false,
+        message: 'RISC event processing failed (logged for investigation)',
+      });
+    }
+  }
+
+  @Get('me')
+  async getCurrentUser(@Req() req: AuthenticatedRequest) {
+    if (!req.user) {
+      throw new UnauthorizedException('Not authenticated');
+    }
+    const { sub, ...rest } = req.user;
+    return {
+      success: true,
+      data: {
+        user: {
+          id: sub,
+          ...rest,
+        },
+      },
+    };
+  }
+
+  @Public()
+  @Post('logout')
+  async logout(@Res({ passthrough: true }) res: Response) {
+    res.clearCookie('access_token');
+    res.clearCookie('refresh_token');
+    return { message: 'Logged out successfully' };
+  }
+
+  @Public()
+  @Post('employee/login')
+  async employeeLogin(@Body() loginDto: EmployeeLoginDto) {
+    const result = await this.employeeAuthenticationService.login(loginDto);
+    return {
+      success: true,
+      data: result,
+      message: 'Employee login successful',
+    };
+  }
+
+  @Post('employee/select-organization')
+  async selectOrganization(
+    @Req() req: AuthenticatedRequest,
+    @Body() body: { organizationId: string },
+  ) {
+    if (!req.user) {
+      throw new UnauthorizedException('Not authenticated');
+    }
+
+    if (req.user.type !== 'employee') {
+      throw new UnauthorizedException('Only employees can select organizations');
+    }
+
+    const result = await this.employeeAuthenticationService.selectOrganization(
+      req.user.sub,
+      body.organizationId,
+    );
+
+    return {
+      success: true,
+      data: result,
+      message: 'Organization selected successfully',
+    };
+  }
+
+  @Public()
+  @Post('forgot-password')
+  async forgotPassword(@Body() dto: ForgotPasswordDto) {
+    const result = await this.passwordResetService.forgotPassword(dto);
+    return {
+      success: result.success,
+      message: result.message,
+      statusCode: 201,
+    };
+  }
+
+  @Public()
+  @Post('verify-reset-otp')
+  async verifyResetOtp(@Body() dto: VerifyResetOtpDto) {
+    const result = await this.passwordResetService.verifyResetOtp(dto);
+    return {
+      success: result.success,
+      message: result.message,
+      data: {
+        token: result.token,
+      },
+      statusCode: 200,
+    };
+  }
+
+  @Public()
+  @Post('reset-password')
+  async resetPassword(@Body() dto: ResetPasswordDto) {
+    const result = await this.passwordResetService.resetPassword(dto);
+    return {
+      success: result.success,
+      message: result.message,
+      statusCode: 200,
+    };
+  }
+}
